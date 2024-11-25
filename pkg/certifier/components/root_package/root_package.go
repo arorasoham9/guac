@@ -23,6 +23,7 @@ import (
 	"github.com/Khan/genqlient/graphql"
 	"github.com/guacsec/guac/pkg/assembler/clients/generated"
 	"github.com/guacsec/guac/pkg/certifier"
+	"github.com/guacsec/guac/pkg/logging"
 )
 
 const guacType string = "guac"
@@ -41,18 +42,24 @@ type packageQuery struct {
 	serviceBatchSize int
 	// add artificial latency to throttle the pagination query
 	addedLatency *time.Duration
+	lastScan     *int
+	queryType    generated.QueryType
 }
 
-var getPackages func(ctx context.Context, client graphql.Client, filter generated.PkgSpec, after *string, first *int) (*generated.PackagesListResponse, error)
+var getPackages func(ctx_ context.Context, client_ graphql.Client, pkgIDs []string, after *string, first *int) (*generated.QueryPackagesListForScanResponse, error)
+var findPackagesThatNeedScanning func(ctx_ context.Context, client_ graphql.Client, queryType generated.QueryType, lastScan *int) (*generated.FindPackagesThatNeedScanningResponse, error)
 
 // NewPackageQuery initializes the packageQuery to query from the graph database
-func NewPackageQuery(client graphql.Client, batchSize, serviceBatchSize int, addedLatency *time.Duration) certifier.QueryComponents {
-	getPackages = generated.PackagesList
+func NewPackageQuery(client graphql.Client, queryType generated.QueryType, batchSize, serviceBatchSize int, addedLatency *time.Duration, lastScan *int) certifier.QueryComponents {
+	getPackages = generated.QueryPackagesListForScan
+	findPackagesThatNeedScanning = generated.FindPackagesThatNeedScanning
 	return &packageQuery{
 		client:           client,
 		batchSize:        batchSize,
 		serviceBatchSize: serviceBatchSize,
 		addedLatency:     addedLatency,
+		lastScan:         lastScan,
+		queryType:        queryType,
 	}
 }
 
@@ -60,6 +67,15 @@ func NewPackageQuery(client graphql.Client, batchSize, serviceBatchSize int, add
 func (p *packageQuery) GetComponents(ctx context.Context, compChan chan<- interface{}) error {
 	if compChan == nil {
 		return fmt.Errorf("compChan cannot be nil")
+	}
+
+	// logger
+	logger := logging.FromContext(ctx)
+	if p.lastScan != nil {
+		lastScanTime := time.Now().Add(time.Duration(-*p.lastScan) * time.Hour).UTC()
+		logger.Infof("last-scan set to: %d hours, last scan time set to: %v", *p.lastScan, lastScanTime)
+	} else {
+		logger.Infof("last-scan not set, running on full package list")
 	}
 
 	tickInterval := 5 * time.Second
@@ -128,15 +144,24 @@ func (p *packageQuery) getPackageNodes(ctx context.Context, nodeChan chan<- *Pac
 	var afterCursor *string
 
 	first := p.batchSize
+
+	pkgScanResults, err := findPackagesThatNeedScanning(ctx, p.client, p.queryType, p.lastScan)
+	if err != nil {
+		return fmt.Errorf("findPackagesThatNeedScanning query failed with error: %w", err)
+	}
+
+	pkgIDs := pkgScanResults.FindPackagesThatNeedScanning
+
 	for {
-		pkgConn, err := getPackages(ctx, p.client, generated.PkgSpec{}, afterCursor, &first)
+		pkgConn, err := getPackages(ctx, p.client, pkgIDs, afterCursor, &first)
 		if err != nil {
 			return fmt.Errorf("failed to query packages with error: %w", err)
 		}
-		if pkgConn == nil || pkgConn.PackagesList == nil {
-			continue
+
+		if pkgConn == nil || pkgConn.QueryPackagesListForScan == nil {
+			break
 		}
-		pkgEdges := pkgConn.PackagesList.Edges
+		pkgEdges := pkgConn.QueryPackagesListForScan.Edges
 
 		for _, pkgNode := range pkgEdges {
 			if pkgNode.Node.Type == guacType {
@@ -153,10 +178,10 @@ func (p *packageQuery) getPackageNodes(ctx context.Context, nodeChan chan<- *Pac
 				}
 			}
 		}
-		if !pkgConn.PackagesList.PageInfo.HasNextPage {
+		if !pkgConn.QueryPackagesListForScan.PageInfo.HasNextPage {
 			break
 		}
-		afterCursor = pkgConn.PackagesList.PageInfo.EndCursor
+		afterCursor = pkgConn.QueryPackagesListForScan.PageInfo.EndCursor
 		// add artificial latency to throttle the pagination query
 		if p.addedLatency != nil {
 			time.Sleep(*p.addedLatency)

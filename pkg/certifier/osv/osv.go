@@ -24,7 +24,7 @@ import (
 	"time"
 
 	"github.com/guacsec/guac/pkg/certifier"
-	attestation_vuln "github.com/guacsec/guac/pkg/certifier/attestation"
+	attestation_vuln "github.com/guacsec/guac/pkg/certifier/attestation/vuln"
 	"github.com/guacsec/guac/pkg/certifier/components/root_package"
 	"github.com/guacsec/guac/pkg/clients"
 	"github.com/guacsec/guac/pkg/events"
@@ -78,18 +78,14 @@ func (o *osvCertifier) CertifyComponent(ctx context.Context, rootComponent inter
 		purls = append(purls, node.Purl)
 	}
 
-	if genOSVDocs, err := EvaluateOSVResponse(ctx, o.osvHTTPClient, purls); err != nil {
+	if _, err := EvaluateOSVResponse(ctx, o.osvHTTPClient, purls, docChannel); err != nil {
 		return fmt.Errorf("could not generate document from OSV results: %w", err)
-	} else {
-		for _, doc := range genOSVDocs {
-			docChannel <- doc
-		}
 	}
 	return nil
 }
 
 // EvaluateOSVResponse takes a list of purls and batch queries OSV for vulnerability information
-func EvaluateOSVResponse(ctx context.Context, client *http.Client, purls []string) ([]*processor.Document, error) {
+func EvaluateOSVResponse(ctx context.Context, client *http.Client, purls []string, docChannel chan<- *processor.Document) ([]*processor.Document, error) {
 	var query osv_scanner.BatchedQuery
 	packMap := map[string]bool{}
 
@@ -117,11 +113,11 @@ func EvaluateOSVResponse(ctx context.Context, client *http.Client, purls []strin
 
 		responseMap[purl] = &response
 	}
-	return generateDocument(responseMap)
+	return generateDocument(responseMap, docChannel)
 }
 
 // generateDocument generated the processor document for ingestion
-func generateDocument(responseMap map[string]*osv_scanner.MinimalResponse) ([]*processor.Document, error) {
+func generateDocument(responseMap map[string]*osv_scanner.MinimalResponse, docChannel chan<- *processor.Document) ([]*processor.Document, error) {
 	var generatedOSVDocs []*processor.Document
 	for purl, response := range responseMap {
 		currentTime := time.Now()
@@ -139,6 +135,9 @@ func generateDocument(responseMap map[string]*osv_scanner.MinimalResponse) ([]*p
 				DocumentRef: events.GetDocRef(payload),
 			},
 		}
+		if docChannel != nil {
+			docChannel <- doc
+		}
 		generatedOSVDocs = append(generatedOSVDocs, doc)
 	}
 	return generatedOSVDocs, nil
@@ -152,16 +151,13 @@ func createAttestation(purl string, vulns []osv_scanner.MinimalVulnerability, cu
 			PredicateType: attestation_vuln.PredicateVuln,
 		},
 		Predicate: attestation_vuln.VulnerabilityPredicate{
-			Invocation: attestation_vuln.Invocation{
-				Uri:        INVOC_URI,
-				ProducerID: PRODUCER_ID,
-			},
 			Scanner: attestation_vuln.Scanner{
 				Uri:     URI,
 				Version: VERSION,
 			},
 			Metadata: attestation_vuln.Metadata{
-				ScannedOn: &currentTime,
+				ScanStartedOn: &currentTime,
+				ScanFinishedOn: &currentTime,
 			},
 		},
 	}
@@ -171,7 +167,7 @@ func createAttestation(purl string, vulns []osv_scanner.MinimalVulnerability, cu
 
 	for _, vuln := range vulns {
 		attestation.Predicate.Scanner.Result = append(attestation.Predicate.Scanner.Result, attestation_vuln.Result{
-			VulnerabilityId: vuln.ID,
+			Id: vuln.ID,
 		})
 	}
 	return attestation
